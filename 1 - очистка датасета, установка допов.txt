@@ -1,0 +1,28 @@
+
+!pip install flask flask-ngrok scikit-learn
+
+import os
+from PIL import Image
+
+data_dir = '/content/art_style_dataset'
+valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff'}
+removed = 0
+
+for root, dirs, files in os.walk(data_dir):
+    for f in files:
+        path = os.path.join(root, f)
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in valid_extensions:
+            os.remove(path)
+            removed += 1
+            print(f"Удалён не-картиночный: {path}")
+            continue
+        try:
+            with Image.open(path) as img:
+                img.verify()
+        except Exception as e:
+            os.remove(path)
+            removed += 1
+            print(f"Удалён битый: {path} ({e})")
+
+print(f"\n✅ Очистка завершена. Удалено файлов: {removed}")

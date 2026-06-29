@@ -1,0 +1,125 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from sklearn.utils import class_weight as cw
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+
+
+data_dir = '/content/art_style_dataset'
+img_height, img_width = 224, 224
+batch_size = 32   
+epochs_head = 20 
+epochs_ft = 10    
+
+
+datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    brightness_range=[0.8, 1.2]
+)
+
+train_gen = datagen.flow_from_directory(
+    data_dir, target_size=(img_height, img_width), batch_size=batch_size,
+    class_mode='categorical', subset='training', shuffle=True, seed=42
+)
+val_gen = datagen.flow_from_directory(
+    data_dir, target_size=(img_height, img_width), batch_size=batch_size,
+    class_mode='categorical', subset='validation', shuffle=False
+)
+
+class_names = list(train_gen.class_indices.keys())
+print("🎨 Классы:", class_names)
+
+with open('class_names.txt', 'w') as f:
+    json.dump(class_names, f)
+
+# Веса классов
+labels = train_gen.classes
+weights = cw.compute_class_weight('balanced', classes=np.unique(labels), y=labels)
+class_weight_dict = dict(enumerate(weights))
+print("Веса классов:", class_weight_dict)
+
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224,224,3), include_top=False, weights='imagenet'
+)
+base_model.trainable = False
+
+model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
+    layers.BatchNormalization(),
+    layers.Dropout(0.5),
+    layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
+    layers.BatchNormalization(),
+    layers.Dropout(0.3),
+    layers.Dense(len(class_names), activation='softmax')
+])
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+              loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+
+callbacks1 = [
+    EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_stage1.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1)
+]
+
+print("\n=== ЭТАП 1: обучение головы ===")
+hist1 = model.fit(train_gen, validation_data=val_gen, epochs=epochs_head,
+                  class_weight=class_weight_dict, callbacks=callbacks1, verbose=1)
+
+
+base_model.trainable = True
+for layer in base_model.layers[:-20]:  # размораживаем только последние 20 слоёв
+    layer.trainable = False
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-6),
+              loss='categorical_crossentropy', metrics=['accuracy'])
+
+callbacks2 = [
+    EarlyStopping(monitor='val_accuracy', patience=4, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_finetune.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-8, verbose=1)
+]
+
+print("\n=== ЭТАП 2: тонкая настройка ===")
+hist2 = model.fit(train_gen, validation_data=val_gen, epochs=epochs_ft,
+                  class_weight=class_weight_dict, callbacks=callbacks2, verbose=1)
+
+
+model.save('style_classifier_improved.h5')
+print("✅ Модель сохранена: style_classifier_improved.h5")
+
+
+def plot_hist(h1, h2):
+    e1 = range(1, len(h1['accuracy'])+1)
+    e2 = range(len(e1), len(e1)+len(h2['accuracy']))
+    plt.figure(figsize=(14,5))
+    plt.subplot(1,2,1)
+    plt.plot(e1, h1['accuracy'], label='Голова (обуч)')
+    plt.plot(e1, h1['val_accuracy'], label='Голова (пров)')
+    plt.plot(e2, h2['accuracy'], label='FT (обуч)')
+    plt.plot(e2, h2['val_accuracy'], label='FT (пров)')
+    plt.title('Точность'); plt.xlabel('Эпоха'); plt.ylabel('Accuracy'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(e1, h1['loss'], label='Голова (обуч)')
+    plt.plot(e1, h1['val_loss'], label='Голова (пров)')
+    plt.plot(e2, h2['loss'], label='FT (обуч)')
+    plt.plot(e2, h2['val_loss'], label='FT (пров)')
+    plt.title('Потери'); plt.xlabel('Эпоха'); plt.ylabel('Loss'); plt.legend()
+    plt.show()
+
+plot_hist(hist1.history, hist2.history)
