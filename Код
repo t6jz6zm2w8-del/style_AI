@@ -1,0 +1,274 @@
+!pip install flask flask-ngrok scikit-learn
+
+import os
+from PIL import Image
+
+data_dir = '/content/art_style_dataset'
+valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff'}
+removed = 0
+
+for root, dirs, files in os.walk(data_dir):
+    for f in files:
+        path = os.path.join(root, f)
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in valid_extensions:
+            os.remove(path)
+            removed += 1
+            print(f"Удалён не-картиночный: {path}")
+            continue
+        try:
+            with Image.open(path) as img:
+                img.verify()
+        except Exception as e:
+            os.remove(path)
+            removed += 1
+            print(f"Удалён битый: {path} ({e})")
+
+print(f"\n✅ Очистка завершена. Удалено файлов: {removed}")
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from sklearn.utils import class_weight as cw
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+
+
+data_dir = '/content/art_style_dataset'
+img_height, img_width = 224, 224
+batch_size = 32   
+epochs_head = 20 
+epochs_ft = 10    
+
+
+datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    brightness_range=[0.8, 1.2]
+)
+
+train_gen = datagen.flow_from_directory(
+    data_dir, target_size=(img_height, img_width), batch_size=batch_size,
+    class_mode='categorical', subset='training', shuffle=True, seed=42
+)
+val_gen = datagen.flow_from_directory(
+    data_dir, target_size=(img_height, img_width), batch_size=batch_size,
+    class_mode='categorical', subset='validation', shuffle=False
+)
+
+class_names = list(train_gen.class_indices.keys())
+print("🎨 Классы:", class_names)
+
+with open('class_names.txt', 'w') as f:
+    json.dump(class_names, f)
+
+# Веса классов
+labels = train_gen.classes
+weights = cw.compute_class_weight('balanced', classes=np.unique(labels), y=labels)
+class_weight_dict = dict(enumerate(weights))
+print("Веса классов:", class_weight_dict)
+
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224,224,3), include_top=False, weights='imagenet'
+)
+base_model.trainable = False
+
+model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
+    layers.BatchNormalization(),
+    layers.Dropout(0.5),
+    layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
+    layers.BatchNormalization(),
+    layers.Dropout(0.3),
+    layers.Dense(len(class_names), activation='softmax')
+])
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+              loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+
+callbacks1 = [
+    EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_stage1.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1)
+]
+
+print("\n=== ЭТАП 1: обучение головы ===")
+hist1 = model.fit(train_gen, validation_data=val_gen, epochs=epochs_head,
+                  class_weight=class_weight_dict, callbacks=callbacks1, verbose=1)
+
+
+base_model.trainable = True
+for layer in base_model.layers[:-20]:  # размораживаем только последние 20 слоёв
+    layer.trainable = False
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-6),
+              loss='categorical_crossentropy', metrics=['accuracy'])
+
+callbacks2 = [
+    EarlyStopping(monitor='val_accuracy', patience=4, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_finetune.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-8, verbose=1)
+]
+
+print("\n=== ЭТАП 2: тонкая настройка ===")
+hist2 = model.fit(train_gen, validation_data=val_gen, epochs=epochs_ft,
+                  class_weight=class_weight_dict, callbacks=callbacks2, verbose=1)
+
+
+model.save('style_classifier_improved.h5')
+print("✅ Модель сохранена: style_classifier_improved.h5")
+
+
+def plot_hist(h1, h2):
+    e1 = range(1, len(h1['accuracy'])+1)
+    e2 = range(len(e1), len(e1)+len(h2['accuracy']))
+    plt.figure(figsize=(14,5))
+    plt.subplot(1,2,1)
+    plt.plot(e1, h1['accuracy'], label='Голова (обуч)')
+    plt.plot(e1, h1['val_accuracy'], label='Голова (пров)')
+    plt.plot(e2, h2['accuracy'], label='FT (обуч)')
+    plt.plot(e2, h2['val_accuracy'], label='FT (пров)')
+    plt.title('Точность'); plt.xlabel('Эпоха'); plt.ylabel('Accuracy'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(e1, h1['loss'], label='Голова (обуч)')
+    plt.plot(e1, h1['val_loss'], label='Голова (пров)')
+    plt.plot(e2, h2['loss'], label='FT (обуч)')
+    plt.plot(e2, h2['val_loss'], label='FT (пров)')
+    plt.title('Потери'); plt.xlabel('Эпоха'); plt.ylabel('Loss'); plt.legend()
+    plt.show()
+
+plot_hist(hist1.history, hist2.history)
+
+import base64, io, json, os, signal, subprocess, threading, time, re
+import numpy as np
+from flask import Flask, request, render_template_string
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
+
+# --- 0. Освобождаем порт 5000, если занят ---
+os.system("fuser -k 5000/tcp 2>/dev/null")
+time.sleep(1)
+
+
+model = load_model('/content/style_classifier_improved.h5')
+with open('/content/class_names.txt', 'r') as f:
+    class_names = json.load(f)
+print("✅ Модель загружена. Классы:", class_names)
+
+HTML_PAGE = '''
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Какой это стиль?</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 1rem; }
+    h1 { color: #3f51b5; }
+    .upload-btn { background: #3f51b5; color: white; padding: 0.7em 1.5em; border: none; border-radius: 6px; cursor: pointer; }
+    .result { margin-top: 1.5em; padding: 1em; background: #e8eaf6; border-radius: 10px; }
+    img { margin-top: 1em; max-width: 300px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+  </style>
+</head>
+<body>
+  <h1>🎨 Определитель стиля живописи</h1>
+  <form method="post" enctype="multipart/form-data">
+    <input type="file" name="file" accept="image/*" required>
+    <br><br>
+    <input class="upload-btn" type="submit" value="Распознать стиль">
+  </form>
+  {% if result %}
+  <div class="result">
+    <h2>Результат: {{ result }}</h2>
+    <img src="{{ image_data }}" alt="Загруженное изображение">
+  </div>
+  {% endif %}
+</body>
+</html>
+'''
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    result = None
+    image_data = None
+    if request.method == 'POST':
+        file = request.files['file']
+        if file:
+            img_bytes = file.read()
+            encoded_img = base64.b64encode(img_bytes).decode('utf-8')
+            image_data = f"data:image/jpeg;base64,{encoded_img}"
+
+            file.seek(0)
+            img = load_img(io.BytesIO(img_bytes), target_size=(224, 224))
+            x = img_to_array(img) / 255.0
+            x = np.expand_dims(x, axis=0)
+
+            predictions = model.predict(x, verbose=0)
+            class_idx = np.argmax(predictions[0])
+            result = class_names[class_idx]
+
+    return render_template_string(HTML_PAGE, result=result, image_data=image_data)
+
+# --- 3. Запускаем Flask в отдельном потоке на порту 5000 ---
+def run_flask():
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+thread = threading.Thread(target=run_flask)
+thread.daemon = True
+thread.start()
+time.sleep(2)  # даём серверу запуститься
+
+# --- 4. Скачиваем cloudflared (с удалением старого) ---
+print("⏳ Устанавливаем Cloudflare Tunnel...")
+os.system("rm -f /tmp/cloudflared")  # удаляем предыдущий
+!wget -q -O /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+!chmod +x /tmp/cloudflared
+
+# --- 5. Запускаем туннель и вытаскиваем ссылку ---
+process = subprocess.Popen(
+    ["/tmp/cloudflared", "tunnel", "--url", "http://localhost:5000"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+)
+
+print("🔍 Ожидаем публичную ссылку...")
+url = None
+for line in iter(process.stdout.readline, ''):
+    # Ищем строку с trycloudflare.com
+    match = re.search(r'https://[^ ]+\.trycloudflare\.com', line)
+    if match:
+        url = match.group(0)
+        break
+    # Иногда ссылка выводится прямо в начале
+    if 'trycloudflare.com' in line:
+        parts = line.split()
+        for p in parts:
+            if p.startswith('https://') and 'trycloudflare.com' in p:
+                url = p
+                break
+    if url:
+        break
+
+if url:
+    print("\n" + "="*50)
+    print("🚀 ГОТОВО! Откройте эту ссылку в браузере:")
+    print(url)
+    print("="*50)
+    print("Сервер работает, пока эта ячейка выполняется.")
+else:
+    print("\n❌ Не удалось получить ссылку автоматически.")
+    print("Попробуйте запустить туннель вручную в новой ячейке:")
+    print("!/tmp/cloudflared tunnel --url http://localhost:5000")
